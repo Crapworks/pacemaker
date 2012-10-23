@@ -1,0 +1,149 @@
+#!/bin/sh
+#
+# 	License:	GNU General Public License (GPL) 
+#	Author: 	Christian Eichelmann <ceichelmann@gmx.de>
+#
+#	Virtual IP Address by BGP protocol.
+#	This script manages IP alias in different subnet with quagga/bgpd.
+#	It can add an IP alias, or remove one.
+#	
+#	The quagga package should be installed to run this RA
+#
+#	usage: $0 {start|stop|status|monitor|validate-all|meta-data}
+#
+#	The "start" arg adds an IP alias.
+#	Surprisingly, the "stop" arg removes one. :-)
+#
+#       OCF parameters are as below
+#       OCF_RESKEY_ip	The IP address in different subnet
+#       OCF_RESKEY_nic	The nic for broadcast the route information
+#
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+ZEBRA=/usr/lib/quagga/zebra
+BGPD=/usr/lib/quagga/bgpd
+VTYSH=/usr/bin/vtysh
+USAGE="usage: $0 {start|stop|status|monitor|validate-all|meta-data}";
+
+#######################################################################
+
+meta_data() {
+cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="VIPAbgp">
+<version>1.0</version>
+
+<longdesc lang="en">
+Virtual IP Address by BGP protocol.
+This script manages IP alias in different subnet with quagga/bgpd.
+It can add an IP alias, or remove one.
+</longdesc>
+<shortdesc lang="en">Manages a virtual IP address through BGP</shortdesc>
+
+<parameters>
+
+<parameter name="ip" unique="1" required="1">
+<longdesc lang="en">
+The IPv4 address in different subnet, for example "192.168.1.1/32".
+</longdesc>
+<shortdesc lang="en">The IP address in different subnet</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="zebra_binary" unique="0">
+<longdesc lang="en">
+Absolute path to the zebra binary.
+</longdesc>
+<shortdesc lang="en">zebra binary</shortdesc>
+<content type="string" default="$ZEBRA"/>
+</parameter>
+
+<parameter name="ripd_binary" unique="0">
+<longdesc lang="en">
+Absolute path to the ripd binary.
+</longdesc>
+<shortdesc lang="en">ripd binary</shortdesc>
+<content type="string" default="$BGBD"/>
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"   timeout="20s" />
+<action name="stop"    timeout="20s" />
+<action name="monitor" depth="0"  timeout="20s" interval="5s" />
+<action name="validate-all"  timeout="20s" />
+<action name="meta-data"  timeout="5s" />
+</actions>
+</resource-agent>
+END
+exit $OCF_SUCCESS
+}
+
+usage() {
+  echo $USAGE >&2
+}
+
+start_ip() {
+    $VTYSH -c "conf t" -c "router bgp 8560" -c "network $OCF_RESKEY_ip"
+    if [ $? -ne 0 ]; then
+        return $OCF_ERR_ARGS
+    fi
+    sleep 1
+    return $OCF_SUCCESS
+}
+
+stop_ip() {
+    status_ip
+    if [ $? -eq $OCF_SUCCESS ]; then
+        $VTYSH -c "conf t" -c "router bgp 8560" -c "no network $OCF_RESKEY_ip"
+        if [ $? -ne 0 ]; then
+            return $OCF_ERR_ARGS
+        else
+            return $OCF_SUCCESS
+        fi
+    else
+        return $OCF_SUCCESS
+    fi
+}
+
+status_ip() {
+    for announced_ip in `$VTYSH -c "show ip bgp" | grep '^\*>' | awk '{print $2}'`
+    do
+        if [ "$announced_ip" = "$OCF_RESKEY_ip" ]; then
+            return $OCF_SUCCESS
+        fi
+    done
+	return $OCF_NOT_RUNNING
+}
+
+if
+  [ $# -ne 1 ]
+then
+  usage
+  exit $OCF_ERR_ARGS
+fi
+
+[ x != x"$OCF_RESKEY_zebra_binary" ] &&
+	ZEBRA=$OCF_RESKEY_zebra_binary
+[ x != x"$OCF_RESKEY_bgpd_binary" ] &&
+	BGPD=$OCF_RESKEY_bgpd_binary
+
+case $1 in
+  start)	start_ip;;
+  stop)		stop_ip;;
+  status)	status_ip;;
+  monitor)	status_ip;;
+  validate-all)	check_binary $IP2UTIL
+		exit $OCF_SUCCESS;;
+  meta-data)	meta_data;;
+  usage)	usage; exit $OCF_SUCCESS;;
+  *)		usage
+ 		exit $OCF_ERR_ARGS
+		;;
+esac
