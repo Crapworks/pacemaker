@@ -1,0 +1,330 @@
+#!/bin/bash
+#
+# 	License:	GNU General Public License (GPL) 
+#	Author: 	Christian Eichelmann <ceichelmann@gmx.de>
+#
+#   This script can be used to build a N-nodes cluster of icinga
+#   cores. It is a multistate ressource agent. The master node
+#   should run ido2db, the slaves shouldn't!
+#
+#   The master node runs active checks, the slaves just accept
+#   passive checks. The icinga instances MUST have all the same
+#   name and write to the same database for this to work.
+#
+#	usage: $0 {start|stop|status|monitor|validate-all|meta-data|demote|promote}
+#
+#       OCF parameters are as below
+#       OCF_RESKEY_commandfile      path to the icinga command file
+#       OCF_RESKEY_livestatus       path to the icinga livestatus socket
+#       OCF_RESKEY_icingainit       path to the icinga init script
+#
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+USAGE="usage: $0 {start|stop|status|monitor|validate-all|meta-data|promote|demote}"
+
+#######################################################################
+
+meta_data() {
+cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="IcingaHA">
+<version>1.1</version>
+
+<longdesc lang="en">
+This script can be used to build a N-nodes cluster of icinga
+cores. It is a multistate ressource agent. The master node
+should run ido2db, the slaves shouldn't!
+
+The master node runs active checks, the slaves just accept
+passive checks. The icinga instances MUST have all the same
+name and write to the same database for this to work.
+
+You need mod_livestatus enabled and running!
+
+</longdesc>
+<shortdesc lang="en">Manages Icinga master/slave clusters</shortdesc>
+
+<parameters>
+
+<parameter name="commandfile" unique="1" required="1">
+<longdesc lang="en">
+Path to the icinga command file
+</longdesc>
+<shortdesc lang="en">The icinga command file</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="livestatus" unique="1" required="1">
+<longdesc lang="en">
+Path to the livestatus socket
+</longdesc>
+<shortdesc lang="en">The livestatus socket</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="icingainit" unique="1" required="1">
+<longdesc lang="en">
+Path to the icinga init script
+</longdesc>
+<shortdesc lang="en">The icinga init script</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"   timeout="20s" />
+<action name="stop"    timeout="20s" />
+<action name="promote" timeout="20s" />
+<action name="demote"  timeout="20s" />
+<action name="notify"  timeout="20s" />
+<action name="monitor" depth="0"  timeout="20s" interval="20s" role="Slave"/>
+<action name="monitor" depth="0"  timeout="20s" interval="10s" role="Master"/>
+<action name="validate-all"  timeout="30s" />
+<action name="meta-data"  timeout="5s" />
+</actions>
+</resource-agent>
+END
+exit $OCF_SUCCESS
+}
+
+usage() {
+  echo $USAGE >&2
+  exit $OCF_ERR_ARGS
+}
+
+get_icinga_active_check_status() {
+    CHECK_HOST=`echo 'GET status' | unixcat /var/lib/icinga/rw/live | awk -F ';' '{print $12}' | tr '\n' ':' | cut -d ':' -f '2'`
+    CHECK_SVN=`echo 'GET status' | unixcat /var/lib/icinga/rw/live | awk -F ';' '{print $13}' | tr '\n' ':' | cut -d ':' -f '2'`
+
+    if [ -z "$CHECK_HOST" -o -z "$CHECK_SVN" ]; then
+        ICINGA_STATE="Unknown"
+    elif [ $CHECK_HOST -eq 1 -a $CHECK_SVN -eq 1 ]; then
+        ICINGA_STATE="Master"
+    elif  [ $CHECK_HOST -eq 0 -a $CHECK_SVN -eq 0 ]; then
+        ICINGA_STATE="Slave"
+    else
+        ICINGA_STATE="Unknown"
+    fi
+}
+
+is_icinga_running() {
+    $OCF_RESKEY_icingainit status
+    return $?
+}
+
+do_cmd() {
+    local cmd="$*"
+    ocf_log debug "$RESOURCE: Calling $cmd"
+    local cmd_out
+    cmd_out=$($cmd 2>&1)
+    ret=$?
+
+    if [ $ret -ne 0 ]; then
+        ocf_log err "$RESOURCE: Called $cmd"
+        ocf_log err "$RESOURCE: Exit code $ret"
+        ocf_log err "$RESOURCE: Command output: $cmd_out"
+    else
+        ocf_log debug "$RESOURCE: Exit code $ret"
+        ocf_log debug "$RESOURCE: Command output: $cmd_out"
+    fi
+
+    echo $cmd_out
+
+    return $ret
+}
+
+icinga_update_prefs() {
+    get_icinga_active_check_status
+
+    if [ "$ICINGA_STATE" = "Master" ]; then
+        do_cmd $CRM_MASTER -v 100
+    elif [ "$ICINGA_STATE" = "Slave" ]; then
+        do_cmd $CRM_MASTER -v 75
+    else
+        do_cmd $CRM_MASTER -v 5
+    fi
+}
+
+start_icinga() {
+    $OCF_RESKEY_icingainit start
+    if [ $? -ne 0 ]; then
+        return $OCF_ERR_GENERIC
+    fi
+
+    demote_icinga
+
+    get_icinga_active_check_status
+
+    if [ "$ICINGA_STATE" != "Slave" ]; then
+        ocf_log err "Icinga start: not in slave mode after start."
+        return $OCF_ERR_GENERIC
+    fi
+
+    return $OCF_SUCCESS
+}
+
+stop_icinga() {
+    # Clear preference for becoming master
+    do_cmd $CRM_MASTER -D
+
+    $OCF_RESKEY_icingainit stop
+    if [ $? -ne 0 ]; then
+        return $OCF_ERR_GENERIC
+    fi
+    return $OCF_SUCCESS
+}
+
+status_icinga() {
+    if is_icinga_running ; then
+        : OK
+    else
+        ocf_log warn "Icinga monitor: not running"
+        return $OCF_NOT_RUNNING
+    fi
+
+    get_icinga_active_check_status
+
+    if [ "$ICINGA_STATE" = "Master" ]; then
+         if [ "$OCF_RESKEY_CRM_meta_interval" -eq 0 ]; then
+            # Restore the master setting during probes
+            ocf_log debug "$RESOURCE monitor: restoring master setting during probe"
+            icinga_update_prefs
+        fi
+        return $OCF_RUNNING_MASTER
+    elif [ "$ICINGA_STATE" = "Slave" ]; then
+        return $OCF_SUCCESS
+    else
+        return $OCF_NOT_RUNNING
+    fi
+
+    return $OCF_ERR_GENERIC
+}
+
+promote_icinga() {
+    if is_icinga_running ; then
+        : OK
+    else
+        ocf_log err "Icinga promote: not running"
+        return $OCF_NOT_RUNNING
+    fi
+
+    get_icinga_active_check_status
+
+    if [ "$ICINGA_STATE" = "Master" ]; then
+        ocf_log info "Icinga promote: already master"
+        return $OCF_SUCCESS
+    fi
+
+    if [ "$ICINGA_STATE" != "Slave" ]; then
+        ocf_log warn "Icinga promote: Not slave to start with."
+        return $OCF_ERR_GENERIC
+    fi    
+
+    # promote !
+    now=`date +%s`
+    printf "[%lu] START_EXECUTING_HOST_CHECKS\n" $now > $OCF_RESKEY_commandfile
+    printf "[%lu] START_EXECUTING_SVC_CHECKS\n" $now > $OCF_RESKEY_commandfile
+
+    sleep 1
+
+    get_icinga_active_check_status
+
+    if [ "$ICINGA_STATE" = "Master" ]; then
+        ocf_log info "Icinga promote: promote succeeded"
+        return $OCF_SUCCESS
+    else
+        ocf_log info "Icinga promote: promote unsuccessful"
+        return $OCF_ERR_GENERIC
+    fi
+}
+
+demote_icinga() {
+    if is_icinga_running ; then
+        : OK
+    else
+        ocf_log err "Icinga demote: not running"
+        return $OCF_NOT_RUNNING
+    fi
+
+    get_icinga_active_check_status
+
+    if [ "$ICINGA_STATE" = "Slave" ]; then
+        ocf_log debug "Icinga demote: already slave"
+        return $OCF_SUCCESS
+    fi
+
+    # demote !
+    now=`date +%s`
+    printf "[%lu] STOP_EXECUTING_HOST_CHECKS\n" $now > $OCF_RESKEY_commandfile
+    printf "[%lu] STOP_EXECUTING_SVC_CHECKS\n" $now > $OCF_RESKEY_commandfile
+
+    sleep 1
+
+    get_icinga_active_check_status
+
+    if [ "$ICINGA_STATE" = "Master" ]; then
+        ocf_log err "Icinga demote: still primary!"
+        return $OCF_ERR_GENERIC
+    fi
+
+    return $OCF_SUCCESS
+}
+
+icinga_notify() {
+    local n_type="$OCF_RESKEY_CRM_meta_notify_type"
+    local n_op="$OCF_RESKEY_CRM_meta_notify_operation"
+    set -- $OCF_RESKEY_CRM_meta_notify_active_resource
+    local n_active="$#"
+    set -- $OCF_RESKEY_CRM_meta_notify_stop_resource
+    local n_stop="$#"
+    set -- $OCF_RESKEY_CRM_meta_notify_start_resource
+    local n_start="$#"
+
+    ocf_log debug "$RESOURCE notify: $n_type for $n_op - counts: active $n_active - starting $n_start - stopping $n_stop"
+
+    case $n_type in
+    post) 
+        case $n_op in
+        start)
+            if [ "$n_active" -eq 2 ]; then
+                : OK
+            fi
+        icinga_update_prefs
+        ;;
+        esac
+    ;;
+    esac
+
+    return $OCF_SUCCESS
+
+}
+
+validate() {
+    exit $OCF_SUCCESS
+}
+
+if [ $# -ne 1 ]; then
+  usage
+  exit $OCF_ERR_ARGS
+fi
+
+CRM_MASTER="${HA_SBIN_DIR}/crm_master -l reboot "
+
+case $1 in
+    start)          start_icinga;;
+    stop)           stop_icinga;;
+    status)         status_icinga;;
+    monitor)        status_icinga;;
+    promote)        promote_icinga;;
+    notify)         icinga_notify;;
+    meta-data)      meta_data;;
+    validate-all)   validate;;
+    demote)         demote_icinga;;
+    *)              usage;;
+esac
